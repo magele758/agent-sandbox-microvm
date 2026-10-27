@@ -165,12 +165,13 @@ async fn create_sandbox(
 
     let booted = tokio::task::spawn_blocking({
         let id = body.sandbox_id.clone();
+        let template = body.template_id.clone();
         let vcpu = body.vcpu;
         let mem = body.mem_mib as u32;
         let tap = slot.tap.clone();
         let mac = slot.mac.clone();
         let ip = slot.ip;
-        move || boot::boot_sandbox(&id, vcpu, mem, &tap, &mac, ip)
+        move || boot::boot_sandbox(&id, &template, vcpu, mem, &tap, &mac, ip)
     })
     .await
     .expect("boot task");
@@ -317,8 +318,8 @@ fn push_guest_init(
         "envdAccessToken": token,
     });
     let body = json!({
-        "path": "/.sandbox-init.json",
-        "data": base64_encode(payload.to_string().as_bytes()),
+        "path": ".sandbox-init.json",
+        "content": base64_encode(payload.to_string().as_bytes()),
     });
     let _ = std::process::Command::new("curl")
         .args([

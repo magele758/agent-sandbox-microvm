@@ -1,0 +1,12 @@
+{
+  "status": 201,
+  "required_fields": [
+    "sandboxID",
+    "templateID",
+    "clientID",
+    "envdVersion",
+    "envdAccessToken",
+    "trafficAccessToken",
+    "domain"
+  ]
+}

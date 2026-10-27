@@ -1,0 +1,17 @@
+{
+  "method": "POST",
+  "path": "/process.Process/Start",
+  "headers": {
+    "E2b-Sandbox-Id": "<sandboxID>",
+    "E2b-Sandbox-Port": "49983",
+    "X-Access-Token": "<envdAccessToken>",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "process": {
+      "cmd": "/bin/echo",
+      "args": ["compat-ok"],
+      "envs": {}
+    }
+  }
+}

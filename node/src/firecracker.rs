@@ -136,17 +136,31 @@ pub fn boot_calls(params: &BootParams<'_>) -> Vec<ApiCall> {
 }
 
 pub fn snapshot_load_call(snapshot_path: &str, mem_backend_path: &str) -> ApiCall {
-    let body = SnapshotLoad {
-        snapshot_path,
-        mem_backend: MemBackend {
-            backend_path: mem_backend_path,
-            backend_type: "File",
-        },
-    };
+    snapshot_load_call_with_net(snapshot_path, mem_backend_path, None)
+}
+
+pub fn snapshot_load_call_with_net(
+    snapshot_path: &str,
+    mem_backend_path: &str,
+    tap_name: Option<&str>,
+) -> ApiCall {
+    let mut body = serde_json::json!({
+        "snapshot_path": snapshot_path,
+        "resume_vm": true,
+        "mem_backend": {
+            "backend_path": mem_backend_path,
+            "backend_type": "File"
+        }
+    });
+    if let Some(tap) = tap_name {
+        body["network_overrides"] = serde_json::json!([
+            {"iface_id": "eth0", "host_dev_name": tap}
+        ]);
+    }
     ApiCall {
         method: "PUT",
         path: "/snapshot/load",
-        body: serde_json::to_value(&body).expect("snapshot"),
+        body,
     }
 }
 

@@ -13,3 +13,10 @@
 /artifacts/bin/jailer.real
 /artifacts/images/
 /artifacts/run/
+
+# Large template/runtime images (keep manifest.json tracked)
+/templates/base/rootfs.ext4
+/templates/base/vmlinux
+/templates/base/mem
+/templates/base/vmstate
+/templates/base/snapshot/

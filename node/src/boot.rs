@@ -1,4 +1,5 @@
-use crate::firecracker::{boot_calls, jailer_argv, jailer_id, ApiCall, BootParams};
+use crate::firecracker::{boot_calls, jailer_argv, jailer_id, snapshot_load_call_with_net, ApiCall, BootParams};
+use crate::template;
 use crate::kvm;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
@@ -63,6 +64,7 @@ impl BootArtifacts {
 /// Applies the ordered API calls only when Linux, `/dev/kvm`, and `SANDBOX_ENABLE_KVM=1`.
 pub fn boot_sandbox(
     sandbox_id: &str,
+    template_id: &str,
     vcpu: u32,
     mem_mib: u32,
     tap_name: &str,
@@ -74,18 +76,19 @@ pub fn boot_sandbox(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (sandbox_id, vcpu, mem_mib, tap_name, guest_mac, guest_ip);
+        let _ = (sandbox_id, template_id, vcpu, mem_mib, tap_name, guest_mac, guest_ip);
         return Err(BootError::KvmUnavailable);
     }
     #[cfg(target_os = "linux")]
     {
-        linux_boot(sandbox_id, vcpu, mem_mib, tap_name, guest_mac, guest_ip)
+        linux_boot(sandbox_id, template_id, vcpu, mem_mib, tap_name, guest_mac, guest_ip)
     }
 }
 
 #[cfg(target_os = "linux")]
 fn linux_boot(
     sandbox_id: &str,
+    template_id: &str,
     vcpu: u32,
     mem_mib: u32,
     tap_name: &str,
@@ -95,7 +98,8 @@ fn linux_boot(
     let artifacts = BootArtifacts::from_env()?;
     let jail_id = jailer_id(sandbox_id);
     std::fs::create_dir_all(&artifacts.chroot_base).map_err(|e| BootError::Stage(e.to_string()))?;
-    ensure_image_cache(&artifacts)?;
+    let tmpl = template::resolve(template_id);
+    ensure_image_cache(&artifacts, &tmpl)?;
     create_tap(&artifacts, tap_name)?;
 
     let uid = std::env::var("SANDBOX_JAILER_UID")
@@ -161,18 +165,23 @@ fn linux_boot(
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let work_rootfs = stage_into_jail(&artifacts, &jail_root)?;
+    let use_snap = template::has_snapshot(&tmpl);
+    let work_rootfs = stage_into_jail(&artifacts, &jail_root, &tmpl, use_snap)?;
     let guest_ip_s = guest_ip.to_string();
-    let calls = boot_calls(&BootParams {
-        vcpu,
-        mem_mib,
-        rootfs_path: "/rootfs.ext4",
-        tap_name,
-        guest_mac,
-        kernel_path: "/vmlinux",
-        guest_ip: &guest_ip_s,
-        enable_net: true,
-    });
+    let calls = if use_snap {
+        vec![snapshot_load_call_with_net("/vmstate", "/mem", Some(tap_name))]
+    } else {
+        boot_calls(&BootParams {
+            vcpu,
+            mem_mib,
+            rootfs_path: "/rootfs.ext4",
+            tap_name,
+            guest_mac,
+            kernel_path: "/vmlinux",
+            guest_ip: &guest_ip_s,
+            enable_net: true,
+        })
+    };
 
     if let Err(err) = configure_vm(&api_sock, &calls) {
         let _ = child.kill();
@@ -192,34 +201,58 @@ fn linux_boot(
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_image_cache(artifacts: &BootArtifacts) -> Result<(), BootError> {
+fn ensure_image_cache(artifacts: &BootArtifacts, tmpl: &template::TemplateArtifacts) -> Result<(), BootError> {
     let images = artifacts.chroot_base.join("images");
     std::fs::create_dir_all(&images).map_err(|e| BootError::Stage(e.to_string()))?;
     let cached_root = images.join("rootfs.ext4");
     let cached_kernel = images.join("vmlinux");
+    let src_root = if tmpl.rootfs.exists() {
+        tmpl.rootfs.clone()
+    } else {
+        artifacts.rootfs.clone()
+    };
     if !cached_root.exists() {
-        copy_best(&artifacts.rootfs, &cached_root)?;
+        template::ficlone_rootfs(&src_root, &cached_root).map_err(BootError::Stage)?;
     }
+    let src_kernel = tmpl
+        .kernel
+        .clone()
+        .unwrap_or_else(|| artifacts.kernel.clone());
     if !cached_kernel.exists() {
-        copy_best(&artifacts.kernel, &cached_kernel)?;
+        copy_best(&src_kernel, &cached_kernel)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn stage_into_jail(artifacts: &BootArtifacts, jail_root: &Path) -> Result<PathBuf, BootError> {
+fn stage_into_jail(
+    artifacts: &BootArtifacts,
+    jail_root: &Path,
+    tmpl: &template::TemplateArtifacts,
+    use_snap: bool,
+) -> Result<PathBuf, BootError> {
     let images = artifacts.chroot_base.join("images");
     let dst_root = jail_root.join("rootfs.ext4");
     let dst_kernel = jail_root.join("vmlinux");
-    // Per-sandbox writable rootfs via reflink/copy from cache.
-    if dst_root.exists() {
-        let _ = std::fs::remove_file(&dst_root);
-    }
-    copy_best(&images.join("rootfs.ext4"), &dst_root)?;
+    let fallback_root = images.join("rootfs.ext4");
+    let src_root = if tmpl.rootfs.exists() {
+        tmpl.rootfs.as_path()
+    } else {
+        fallback_root.as_path()
+    };
+    // Per-sandbox writable rootfs via FICLONE from template/cache.
+    template::ficlone_rootfs(src_root, &dst_root).map_err(BootError::Stage)?;
     if !dst_kernel.exists() {
-        if std::fs::hard_link(images.join("vmlinux"), &dst_kernel).is_err() {
-            copy_best(&images.join("vmlinux"), &dst_kernel)?;
+        let src_k = images.join("vmlinux");
+        if std::fs::hard_link(&src_k, &dst_kernel).is_err() {
+            copy_best(&src_k, &dst_kernel)?;
         }
+    }
+    if use_snap {
+        let mem = tmpl.snap_mem.as_ref().unwrap();
+        let vm = tmpl.snap_vmstate.as_ref().unwrap();
+        copy_best(mem, &jail_root.join("mem"))?;
+        copy_best(vm, &jail_root.join("vmstate"))?;
     }
     Ok(dst_root)
 }
@@ -320,7 +353,7 @@ fn configure_vm(api_sock: &Path, calls: &[ApiCall]) -> Result<(), BootError> {
                     .map_err(BootError::Spawn)?;
                 for call in calls {
                     let body = serde_json::to_string(&call.body).expect("body");
-                    if let Err(err) = put_json(&mut stream, call.path, &body) {
+                    if let Err(err) = put_json(&mut stream, call.method, call.path, &body) {
                         // reconnect for next attempts if keep-alive broke
                         last = err.clone();
                         if let Ok(mut s2) = UnixStream::connect(api_sock) {
@@ -328,7 +361,7 @@ fn configure_vm(api_sock: &Path, calls: &[ApiCall]) -> Result<(), BootError> {
                                 .map_err(BootError::Spawn)?;
                             s2.set_write_timeout(Some(Duration::from_secs(5)))
                                 .map_err(BootError::Spawn)?;
-                            put_json(&mut s2, call.path, &body).map_err(|e| BootError::Api {
+                            put_json(&mut s2, call.method, call.path, &body).map_err(|e| BootError::Api {
                                 path: call.path,
                                 detail: e,
                             })?;
@@ -354,9 +387,9 @@ fn configure_vm(api_sock: &Path, calls: &[ApiCall]) -> Result<(), BootError> {
 }
 
 #[cfg(target_os = "linux")]
-fn put_json(stream: &mut std::os::unix::net::UnixStream, path: &str, body: &str) -> Result<(), String> {
+fn put_json(stream: &mut std::os::unix::net::UnixStream, method: &str, path: &str, body: &str) -> Result<(), String> {
     let req = format!(
-        "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;

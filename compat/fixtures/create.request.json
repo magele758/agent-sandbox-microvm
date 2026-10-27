@@ -1,0 +1,15 @@
+{
+  "method": "POST",
+  "path": "/v2/sandboxes",
+  "headers": {
+    "X-API-Key": "e2b_devkey",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "templateID": "base",
+    "timeout": 60,
+    "envVars": {"FOO": "bar"},
+    "metadata": {},
+    "allow_internet_access": true
+  }
+}

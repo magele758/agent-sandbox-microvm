@@ -1,0 +1,13 @@
+{
+  "method": "POST",
+  "path": "/filesystem.Filesystem/Read",
+  "headers": {
+    "E2b-Sandbox-Id": "<sandboxID>",
+    "E2b-Sandbox-Port": "49983",
+    "X-Access-Token": "<envdAccessToken>",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "path": "/workspace/.sandbox-init.json"
+  }
+}
