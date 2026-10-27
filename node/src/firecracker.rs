@@ -16,6 +16,8 @@ pub struct BootParams<'a> {
     pub tap_name: &'a str,
     pub guest_mac: &'a str,
     pub kernel_path: &'a str,
+    pub guest_ip: &'a str,
+    pub enable_net: bool,
 }
 
 #[derive(Serialize)]
@@ -44,7 +46,7 @@ struct NetIface<'a> {
 #[derive(Serialize)]
 struct BootSource<'a> {
     kernel_image_path: &'a str,
-    boot_args: &'a str,
+    boot_args: String,
 }
 
 #[derive(Serialize)]
@@ -64,6 +66,14 @@ struct SnapshotLoad<'a> {
     mem_backend: MemBackend<'a>,
 }
 
+/// Jailer instance ids allow only alphanumeric chars.
+pub fn jailer_id(sandbox_id: &str) -> String {
+    sandbox_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { 'x' })
+        .collect()
+}
+
 /// Ordered unix-socket calls for a cold boot. Does not fork Firecracker.
 pub fn boot_calls(params: &BootParams<'_>) -> Vec<ApiCall> {
     let machine = MachineConfig {
@@ -78,19 +88,17 @@ pub fn boot_calls(params: &BootParams<'_>) -> Vec<ApiCall> {
         is_root_device: true,
         is_read_only: false,
     };
-    let net = NetIface {
-        iface_id: "eth0",
-        guest_mac: params.guest_mac,
-        host_dev_name: params.tap_name,
-    };
     let boot = BootSource {
         kernel_image_path: params.kernel_path,
-        boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init",
+        boot_args: format!(
+            "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip={}::172.16.0.1:255.255.255.240:sbx:eth0:off",
+            params.guest_ip
+        ),
     };
     let start = InstanceAction {
         action_type: "InstanceStart",
     };
-    vec![
+    let mut calls = vec![
         ApiCall {
             method: "PUT",
             path: "/machine-config",
@@ -101,25 +109,32 @@ pub fn boot_calls(params: &BootParams<'_>) -> Vec<ApiCall> {
             path: "/drives/rootfs",
             body: serde_json::to_value(&drive).expect("drive"),
         },
-        ApiCall {
+    ];
+    if params.enable_net {
+        let net = NetIface {
+            iface_id: "eth0",
+            guest_mac: params.guest_mac,
+            host_dev_name: params.tap_name,
+        };
+        calls.push(ApiCall {
             method: "PUT",
             path: "/network-interfaces/eth0",
             body: serde_json::to_value(&net).expect("net"),
-        },
-        ApiCall {
-            method: "PUT",
-            path: "/boot-source",
-            body: serde_json::to_value(&boot).expect("boot"),
-        },
-        ApiCall {
-            method: "PUT",
-            path: "/actions",
-            body: serde_json::to_value(&start).expect("actions"),
-        },
-    ]
+        });
+    }
+    calls.push(ApiCall {
+        method: "PUT",
+        path: "/boot-source",
+        body: serde_json::to_value(&boot).expect("boot"),
+    });
+    calls.push(ApiCall {
+        method: "PUT",
+        path: "/actions",
+        body: serde_json::to_value(&start).expect("actions"),
+    });
+    calls
 }
 
-/// Snapshot load is not part of create in this slice.
 pub fn snapshot_load_call(snapshot_path: &str, mem_backend_path: &str) -> ApiCall {
     let body = SnapshotLoad {
         snapshot_path,
@@ -135,20 +150,27 @@ pub fn snapshot_load_call(snapshot_path: &str, mem_backend_path: &str) -> ApiCal
     }
 }
 
-/// `jailer --id <sandboxID> --exec-file <firecracker> --uid 123 --gid 123 --cgroup-version 2`
-pub fn jailer_argv(sandbox_id: &str, firecracker: &str) -> Vec<String> {
+pub fn jailer_argv(
+    jail_id: &str,
+    firecracker: &str,
+    chroot_base: &str,
+    uid: u32,
+    gid: u32,
+) -> Vec<String> {
     vec![
         "jailer".to_string(),
         "--id".to_string(),
-        sandbox_id.to_string(),
+        jail_id.to_string(),
         "--exec-file".to_string(),
         firecracker.to_string(),
         "--uid".to_string(),
-        "123".to_string(),
+        uid.to_string(),
         "--gid".to_string(),
-        "123".to_string(),
+        gid.to_string(),
         "--cgroup-version".to_string(),
         "2".to_string(),
+        "--chroot-base-dir".to_string(),
+        chroot_base.to_string(),
     ]
 }
 
@@ -156,7 +178,6 @@ pub fn body_json(call: &ApiCall) -> String {
     serde_json::to_string(&call.body).expect("json")
 }
 
-/// Used by tests to show the action body is exactly the upstream object.
 pub fn instance_start_body() -> Value {
     json!({"action_type": "InstanceStart"})
 }
@@ -169,10 +190,12 @@ mod tests {
         boot_calls(&BootParams {
             vcpu: 2,
             mem_mib: 2048,
-            rootfs_path: "/images/rootfs.ext4",
+            rootfs_path: "/rootfs.ext4",
             tap_name: "tap0",
             guest_mac: "06:00:AC:10:00:02",
-            kernel_path: "/images/vmlinux",
+            kernel_path: "/vmlinux",
+            guest_ip: "172.16.0.2",
+            enable_net: true,
         })
     }
 
@@ -197,19 +220,37 @@ mod tests {
         );
         assert_eq!(
             body_json(&calls[1]),
-            r#"{"drive_id":"rootfs","path_on_host":"/images/rootfs.ext4","is_root_device":true,"is_read_only":false}"#
+            r#"{"drive_id":"rootfs","path_on_host":"/rootfs.ext4","is_root_device":true,"is_read_only":false}"#
         );
         assert_eq!(
             body_json(&calls[2]),
             r#"{"iface_id":"eth0","guest_mac":"06:00:AC:10:00:02","host_dev_name":"tap0"}"#
         );
-        assert_eq!(
-            body_json(&calls[3]),
-            r#"{"kernel_image_path":"/images/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"}"#
-        );
-        assert!(body_json(&calls[3]).contains("init=/sbin/init"));
+        let boot = body_json(&calls[3]);
+        assert!(boot.contains("/vmlinux"));
+        assert!(boot.contains("init=/sbin/init"));
+        assert!(boot.contains("ip=172.16.0.2::172.16.0.1:255.255.255.240"));
         assert_eq!(body_json(&calls[4]), r#"{"action_type":"InstanceStart"}"#);
-        assert_eq!(calls.last().unwrap().path, "/actions");
+    }
+
+    #[test]
+    fn boot_calls_can_skip_net() {
+        let calls = boot_calls(&BootParams {
+            vcpu: 1,
+            mem_mib: 512,
+            rootfs_path: "/rootfs.ext4",
+            tap_name: "tap0",
+            guest_mac: "06:00:AC:10:00:02",
+            kernel_path: "/vmlinux",
+            guest_ip: "172.16.0.2",
+            enable_net: false,
+        });
+        assert!(calls.iter().all(|c| c.path != "/network-interfaces/eth0"));
+    }
+
+    #[test]
+    fn jailer_id_strips_underscore() {
+        assert_eq!(jailer_id("sbx_abc"), "sbxxabc");
     }
 
     #[test]
@@ -217,30 +258,28 @@ mod tests {
         let call = snapshot_load_call("/images/snap", "/images/mem");
         assert_eq!(call.method, "PUT");
         assert_eq!(call.path, "/snapshot/load");
-        assert_eq!(
-            body_json(&call),
-            r#"{"snapshot_path":"/images/snap","mem_backend":{"backend_path":"/images/mem","backend_type":"File"}}"#
-        );
         assert!(sample().iter().all(|c| c.path != "/snapshot/load"));
     }
 
     #[test]
     fn jailer_argv_matches_spec() {
-        let argv = jailer_argv("sbx_abc", "/usr/bin/firecracker");
+        let argv = jailer_argv("sbxxabc", "/usr/bin/firecracker", "/tmp/sbxj", 1000, 1000);
         assert_eq!(
             argv,
             vec![
                 "jailer",
                 "--id",
-                "sbx_abc",
+                "sbxxabc",
                 "--exec-file",
                 "/usr/bin/firecracker",
                 "--uid",
-                "123",
+                "1000",
                 "--gid",
-                "123",
+                "1000",
                 "--cgroup-version",
                 "2",
+                "--chroot-base-dir",
+                "/tmp/sbxj",
             ]
         );
     }

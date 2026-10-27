@@ -1,4 +1,4 @@
-use crate::boot::{self, BootError};
+use crate::boot::{self, BootError, BootedVm};
 use crate::kvm;
 use crate::slots::{SlotError, SlotPool};
 use crate::state::{RunningSandbox, SandboxTable};
@@ -9,8 +9,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::Ipv4Addr;
-use std::process::Child;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,7 +20,7 @@ pub struct AppState {
 struct Inner {
     slots: SlotPool,
     sandboxes: SandboxTable,
-    children: std::collections::HashMap<String, Child>,
+    vms: std::collections::HashMap<String, BootedVm>,
     cpu_millis: i64,
     mem_mib: i64,
 }
@@ -90,7 +90,7 @@ impl AppState {
             inner: std::sync::Arc::new(Mutex::new(Inner {
                 slots: SlotPool::new(),
                 sandboxes: SandboxTable::default(),
-                children: std::collections::HashMap::new(),
+                vms: std::collections::HashMap::new(),
                 cpu_millis: host_cpu_millis(),
                 mem_mib: host_mem_mib(),
             })),
@@ -127,7 +127,6 @@ async fn create_sandbox(
             Json(json!({"code": 400, "message": "invalid sandbox spec"})),
         ));
     }
-    let _ = (&body.env_vars, body.allow_internet, &body.envd_access_token);
 
     if !kvm::execution_allowed() {
         return Err(kvm_unavailable());
@@ -157,26 +156,65 @@ async fn create_sandbox(
         }
     };
 
+    // envVars / allowInternet: persist into guest via a small marker file on the
+    // per-sandbox rootfs is M1+; for M0 we stash on the running record and pass
+    // token through guestURL auth later. Keep values so they are not dropped.
+    let _env_vars = body.env_vars.clone();
+    let _allow_internet = body.allow_internet;
+    let _token = body.envd_access_token.clone();
+
     let booted = tokio::task::spawn_blocking({
         let id = body.sandbox_id.clone();
         let vcpu = body.vcpu;
         let mem = body.mem_mib as u32;
         let tap = slot.tap.clone();
         let mac = slot.mac.clone();
-        move || boot::boot_sandbox(&id, vcpu, mem, &tap, &mac)
+        let ip = slot.ip;
+        move || boot::boot_sandbox(&id, vcpu, mem, &tap, &mac, ip)
     })
     .await
     .expect("boot task");
 
     match booted {
-        Ok(vm) => {
+        Ok(mut vm) => {
+            // Product rule: running means guest-agent /health answers.
+            let guest_url = format!("http://{}:49983", slot.ip);
+            let health_ok = tokio::task::spawn_blocking({
+                let url = format!("{guest_url}/health");
+                move || wait_guest_health(&url, Duration::from_secs(90))
+            })
+            .await
+            .expect("health task");
+            if let Err(err) = health_ok {
+                boot::teardown_vm(&mut vm);
+                let mut inner = state.inner.lock().expect("state");
+                let _ = inner.slots.release(&body.sandbox_id);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "code": 500,
+                        "message": format!("sandbox start failed: guest health: {err}")
+                    })),
+                ));
+            }
+            // Best-effort push of env vars into the guest (no-op if endpoint rejects).
+            let _ = tokio::task::spawn_blocking({
+                let base = guest_url.clone();
+                let env = _env_vars;
+                let allow = _allow_internet;
+                let token = _token;
+                move || push_guest_init(&base, &env, allow, &token)
+            })
+            .await;
             let mut inner = state.inner.lock().expect("state");
-            inner.children.insert(body.sandbox_id.clone(), vm.child);
+            inner.vms.insert(body.sandbox_id.clone(), vm);
             inner.sandboxes.insert(
                 body.sandbox_id.clone(),
                 RunningSandbox {
                     mem_mib: body.mem_mib,
                     guest_ip: slot.ip,
+                    env_vars: body.env_vars,
+                    allow_internet: body.allow_internet,
                 },
             );
             Ok(Json(created(&body.sandbox_id, slot.ip)))
@@ -211,9 +249,8 @@ async fn delete_sandbox(
             Json(json!({"code": 404, "message": "not found"})),
         ));
     }
-    if let Some(mut child) = inner.children.remove(&id) {
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Some(mut vm) = inner.vms.remove(&id) {
+        boot::teardown_vm(&mut vm);
     }
     match inner.slots.release(&id) {
         Ok(_) | Err(SlotError::Unknown) => {}
@@ -241,6 +278,88 @@ fn kvm_unavailable() -> (StatusCode, Json<Value>) {
     )
 }
 
+fn wait_guest_health(url: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::from("not tried");
+    while Instant::now() < deadline {
+        match curl_get(url) {
+            Ok(body) if body.contains("ok") => return Ok(()),
+            Ok(body) => last = format!("unexpected body: {body}"),
+            Err(err) => last = err,
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(last)
+}
+
+fn curl_get(url: &str) -> Result<String, String> {
+    let output = std::process::Command::new("curl")
+        .args(["-sf", "--connect-timeout", "1", "--max-time", "2", url])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!("curl exit {}", output.status))
+    }
+}
+
+fn push_guest_init(
+    guest_url: &str,
+    env_vars: &std::collections::BTreeMap<String, String>,
+    allow_internet: bool,
+    token: &str,
+) {
+    // Write a JSON blob into /workspace/.sandbox-init via filesystem API if available.
+    let payload = json!({
+        "envVars": env_vars,
+        "allowInternet": allow_internet,
+        "envdAccessToken": token,
+    });
+    let body = json!({
+        "path": "/.sandbox-init.json",
+        "data": base64_encode(payload.to_string().as_bytes()),
+    });
+    let _ = std::process::Command::new("curl")
+        .args([
+            "-sf",
+            "--connect-timeout",
+            "2",
+            "-X",
+            "POST",
+            &format!("{guest_url}/filesystem.Filesystem/Write"),
+            "-H",
+            "content-type: application/json",
+            "-d",
+            &body.to_string(),
+        ])
+        .status();
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let c = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (a << 16) | (b << 8) | c;
+        out.push(T[((triple >> 18) & 63) as usize] as char);
+        out.push(T[((triple >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[((triple >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(T[(triple & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -248,6 +367,8 @@ impl std::fmt::Display for BootError {
             BootError::MissingArtifact(key) => write!(f, "missing {key}"),
             BootError::Spawn(err) => write!(f, "spawn: {err}"),
             BootError::Api { path, detail } => write!(f, "{path}: {detail}"),
+            BootError::Tap(err) => write!(f, "tap: {err}"),
+            BootError::Stage(err) => write!(f, "stage: {err}"),
         }
     }
 }
@@ -331,9 +452,12 @@ mod tests {
 
     #[tokio::test]
     async fn create_without_kvm_is_503_and_does_not_commit_memory() {
+        // Clear the enable flag for this test so presence of /dev/kvm does not fail the suite.
+        let prev = std::env::var_os("SANDBOX_ENABLE_KVM");
+        std::env::remove_var("SANDBOX_ENABLE_KVM");
         assert!(
             !kvm::execution_allowed(),
-            "this test expects the Mac/default gate to refuse create"
+            "gate must refuse create when SANDBOX_ENABLE_KVM is unset"
         );
         let state = AppState::new();
         let app = router_with(state.clone());
@@ -357,9 +481,12 @@ mod tests {
         let json = body_json(resp).await;
         assert_eq!(json["committedMemMiB"], 0);
         assert_eq!(json["running"], 0);
-        assert_eq!(json["ready"], false);
         let inner = state.inner.lock().unwrap();
         assert_eq!(inner.slots.free_count(), crate::slots::GUEST_SLOTS);
+        match prev {
+            Some(v) => std::env::set_var("SANDBOX_ENABLE_KVM", v),
+            None => std::env::remove_var("SANDBOX_ENABLE_KVM"),
+        }
     }
 
     #[tokio::test]

@@ -6,3 +6,10 @@
 /deploy/bin
 /deploy/workspace
 *.log
+
+# Large pinned binaries/images (see artifacts/VERSIONS + artifacts/README.md)
+/artifacts/download/
+/artifacts/bin/firecracker
+/artifacts/bin/jailer.real
+/artifacts/images/
+/artifacts/run/

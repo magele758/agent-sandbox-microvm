@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 
 #[derive(Debug, Clone)]
 pub struct RunningSandbox {
     pub mem_mib: i64,
     pub guest_ip: Ipv4Addr,
+    pub env_vars: BTreeMap<String, String>,
+    pub allow_internet: bool,
 }
 
 #[derive(Debug, Default)]
@@ -48,6 +50,8 @@ mod tests {
             RunningSandbox {
                 mem_mib: 2048,
                 guest_ip: Ipv4Addr::new(172, 16, 0, 2),
+                env_vars: BTreeMap::new(),
+                allow_internet: true,
             },
         );
         table.insert(
@@ -55,6 +59,8 @@ mod tests {
             RunningSandbox {
                 mem_mib: 512,
                 guest_ip: Ipv4Addr::new(172, 16, 0, 3),
+                env_vars: BTreeMap::new(),
+                allow_internet: false,
             },
         );
         assert_eq!(table.running_count(), 2);

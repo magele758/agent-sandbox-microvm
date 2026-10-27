@@ -133,6 +133,9 @@ async fn require_token(
 }
 
 fn token_ok(expected: &str, headers: &HeaderMap) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
     match headers.get("x-access-token").and_then(|v| v.to_str().ok()) {
         Some(got) => got == expected,
         None => false,
