@@ -1,0 +1,8 @@
+/api/bin
+/edge/bin
+/node/target
+/guest/target
+.env
+/deploy/bin
+/deploy/workspace
+*.log

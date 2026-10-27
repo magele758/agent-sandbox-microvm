@@ -1,0 +1,21 @@
+[package]
+name = "node-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted sandbox node agent"
+publish = false
+
+[[bin]]
+name = "node-agent"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
