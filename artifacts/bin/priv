@@ -1,0 +1,7 @@
+#!/bin/bash
+# Run a host command as root via docker privileged + chroot /host (no sudo).
+set -euo pipefail
+IMG=${SANDBOX_PRIV_IMAGE:-postgres:16-alpine}
+exec docker run --rm --privileged --network=host --device=/dev/kvm \
+  -v /:/host \
+  "$IMG" chroot /host "$@"

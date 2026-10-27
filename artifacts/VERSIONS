@@ -1,0 +1,12 @@
+firecracker=v1.17.0
+jailer=v1.17.0
+kernel=vmlinux-6.18.54
+kernel_source=s3://spec.ccfc.min/firecracker-ci/20261023-dd7c24b0d165-0/x86_64/vmlinux-6.18.54
+fc_tarball=https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz
+ubuntu_squashfs=s3://spec.ccfc.min/firecracker-ci/20261023-dd7c24b0d165-0/x86_64/ubuntu-24.04.squashfs
+rootfs=images/rootfs.ext4 (built with guest-agent)
+host_paths:
+  SANDBOX_JAILER=/home/shinemo/penglei/agent-sandbox-microvm/artifacts/bin/jailer
+  SANDBOX_FIRECRACKER=/home/shinemo/penglei/agent-sandbox-microvm/artifacts/bin/firecracker
+  SANDBOX_KERNEL=/home/shinemo/penglei/agent-sandbox-microvm/artifacts/images/vmlinux
+  SANDBOX_ROOTFS=/home/shinemo/penglei/agent-sandbox-microvm/artifacts/images/rootfs.ext4

@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "fc_version": "1.17.0",
+  "kernel_version": "6.18.54",
+  "arch": "x86_64",
+  "vcpu": 1,
+  "mem_mib": 512,
+  "guest_agent_version": "0.1.0",
+  "rootfs": "rootfs.ext4",
+  "vmstate": "vmstate",
+  "mem": "mem",
+  "snapshot": "Full"
+}

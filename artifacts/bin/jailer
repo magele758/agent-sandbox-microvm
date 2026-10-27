@@ -1,0 +1,9 @@
+#!/bin/bash
+# SANDBOX_JAILER entrypoint: real jailer under docker privileged (unshare needs root).
+set -euo pipefail
+REAL="${SANDBOX_JAILER_REAL:-$(dirname "$0")/jailer.real}"
+IMG=${SANDBOX_PRIV_IMAGE:-postgres:16-alpine}
+# Keep container in foreground so node Child tracks it.
+exec docker run --rm --privileged --network=host --device=/dev/kvm \
+  -v /:/host \
+  "$IMG" chroot /host "$REAL" "$@"
