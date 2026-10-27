@@ -35,3 +35,12 @@ Internal, header `Authorization: Bearer $INTERNAL_TOKEN`:
 `GET /internal/routes/{id}` -> `{"sandboxID","state","guestURL","envdAccessToken","trafficAccessToken"}`. Unknown id is 404. Do not require a tenant key.
 
 Placement: `NODE_URLS` comma-separated. Poll `GET /v1/capacity`. Pick the ready node with the lowest `committedMemMiB`. One refusal retries the next node once.
+
+## Node status and admin
+
+| Method | Path | Response |
+| --- | --- | --- |
+| GET | `/v1/status` | 200 service status. `ready` is true only when KVM execution is allowed and jailer, firecracker, kernel, and rootfs paths are files. |
+| GET | `/admin` | 200 HTML admin page. It reads the same `GET /v1/status` payload. |
+
+`/v1/health` stays a liveness check. External status consumers use `/v1/status`.
