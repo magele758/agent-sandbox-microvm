@@ -35,6 +35,16 @@ impl SandboxTable {
     pub fn committed_mem_mib(&self) -> i64 {
         self.running.values().map(|s| s.mem_mib).sum()
     }
+
+    pub fn list(&self) -> Vec<(String, i64, String)> {
+        let mut rows: Vec<_> = self
+            .running
+            .iter()
+            .map(|(id, sb)| (id.clone(), sb.mem_mib, sb.guest_ip.to_string()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use crate::state::{RunningSandbox, SandboxTable};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
+use axum::response::Html;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -78,6 +79,8 @@ pub fn router() -> Router {
 pub fn router_with(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/status", get(service_status))
+        .route("/admin", get(admin_page))
         .route("/v1/capacity", get(capacity))
         .route("/v1/sandboxes", post(create_sandbox))
         .route("/v1/sandboxes/:id", axum::routing::delete(delete_sandbox))
@@ -115,6 +118,153 @@ async fn capacity(State(state): State<AppState>) -> Json<Capacity> {
         ready: kvm::kvm_device_present(),
     })
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KvmStatus {
+    device_present: bool,
+    execution_allowed: bool,
+}
+
+#[derive(Serialize)]
+struct ArtifactReport {
+    jailer: bool,
+    firecracker: bool,
+    kernel: bool,
+    rootfs: bool,
+    configured: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SandboxReport {
+    #[serde(rename = "sandboxID")]
+    sandbox_id: String,
+    #[serde(rename = "memMiB")]
+    mem_mi_b: i64,
+    #[serde(rename = "guestIP")]
+    guest_ip: String,
+    state: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceStatus {
+    service: &'static str,
+    status: &'static str,
+    ready: bool,
+    kvm: KvmStatus,
+    capacity: Capacity,
+    artifacts: ArtifactReport,
+    sandboxes: Vec<SandboxReport>,
+}
+
+fn artifact_file(key: &str) -> bool {
+    std::env::var_os(key)
+        .map(|value| std::path::Path::new(&value).is_file())
+        .unwrap_or(false)
+}
+
+fn artifact_report() -> ArtifactReport {
+    let jailer = artifact_file("SANDBOX_JAILER");
+    let firecracker = artifact_file("SANDBOX_FIRECRACKER");
+    let kernel = artifact_file("SANDBOX_KERNEL");
+    let rootfs = artifact_file("SANDBOX_ROOTFS");
+    ArtifactReport {
+        jailer,
+        firecracker,
+        kernel,
+        rootfs,
+        configured: jailer && firecracker && kernel && rootfs,
+    }
+}
+
+async fn service_status(State(state): State<AppState>) -> Json<ServiceStatus> {
+    let inner = state.inner.lock().expect("state");
+    let artifacts = artifact_report();
+    let kvm_status = KvmStatus {
+        device_present: kvm::kvm_device_present(),
+        execution_allowed: kvm::execution_allowed(),
+    };
+    let ready = kvm_status.execution_allowed && artifacts.configured;
+    let capacity = Capacity {
+        cpu_millis: inner.cpu_millis,
+        mem_mi_b: inner.mem_mib,
+        committed_mem_mi_b: inner.sandboxes.committed_mem_mib(),
+        running: inner.sandboxes.running_count(),
+        ready: kvm_status.device_present,
+    };
+    let sandboxes = inner
+        .sandboxes
+        .list()
+        .into_iter()
+        .map(|(id, mem, ip)| SandboxReport {
+            sandbox_id: id,
+            mem_mi_b: mem,
+            guest_ip: ip,
+            state: "running",
+        })
+        .collect();
+    Json(ServiceStatus {
+        service: "agent-sandbox-node",
+        status: if ready { "ok" } else { "degraded" },
+        ready,
+        kvm: kvm_status,
+        capacity,
+        artifacts,
+        sandboxes,
+    })
+}
+
+async fn admin_page() -> Html<&'static str> {
+    Html(ADMIN_HTML)
+}
+
+const ADMIN_HTML: &str = r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>microvm 管理</title>
+<style>
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 24px; background: #0f1419; color: #e7ecf3; }
+  h1 { font-size: 20px; }
+  .card { background: #1a2332; border-radius: 12px; padding: 16px; margin: 12px 0; }
+  .ok { color: #3dd68c; } .bad { color: #ff6b6b; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #2c3a4f; }
+  code { color: #9fd0ff; }
+</style>
+</head>
+<body>
+<h1>microvm 节点管理</h1>
+<p>数据来自 <code>/v1/status</code></p>
+<div id="view">加载中…</div>
+<script>
+async function load() {
+  const view = document.getElementById('view');
+  try {
+    const resp = await fetch('/v1/status');
+    const data = await resp.json();
+    const cls = data.ready ? 'ok' : 'bad';
+    const rows = (data.sandboxes || []).map(s =>
+      `<tr><td>${s.sandboxID}</td><td>${s.state}</td><td>${s.guestIP}</td><td>${s.memMiB}</td></tr>`
+    ).join('') || '<tr><td colspan="4">没有运行中的 sandbox</td></tr>';
+    view.innerHTML = `
+      <div class="card"><b class="${cls}">${data.status}</b> · ready=${data.ready} · kvm 设备=${data.kvm.devicePresent} · 允许启动=${data.kvm.executionAllowed}</div>
+      <div class="card">CPU ${data.capacity.cpuMillis} millis · 内存 ${data.capacity.memMiB} MiB · 已提交 ${data.capacity.committedMemMiB} MiB · 运行 ${data.capacity.running}</div>
+      <div class="card">制品 jailer=${data.artifacts.jailer} firecracker=${data.artifacts.firecracker} kernel=${data.artifacts.kernel} rootfs=${data.artifacts.rootfs}</div>
+      <div class="card"><table><tr><th>sandbox</th><th>状态</th><th>guest IP</th><th>内存 MiB</th></tr>${rows}</table></div>`;
+  } catch (err) {
+    view.innerHTML = '<div class="card bad">读取 /v1/status 失败</div>';
+  }
+}
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>
+"#;
 
 async fn create_sandbox(
     State(state): State<AppState>,
@@ -187,7 +337,7 @@ async fn create_sandbox(
             .await
             .expect("health task");
             if let Err(err) = health_ok {
-                boot::teardown_vm(&mut vm);
+                let _ = boot::teardown_vm(&mut vm);
                 let mut inner = state.inner.lock().expect("state");
                 let _ = inner.slots.release(&body.sandbox_id);
                 return Err((
@@ -244,15 +394,29 @@ async fn delete_sandbox(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let mut inner = state.inner.lock().expect("state");
-    if inner.sandboxes.remove(&id).is_none() {
+    let Some(sandbox) = inner.sandboxes.remove(&id) else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"code": 404, "message": "not found"})),
         ));
+    };
+    let vm = inner.vms.remove(&id);
+    drop(inner);
+    if let Some(mut vm) = vm {
+        if let Err(err) = boot::teardown_vm(&mut vm) {
+            let mut inner = state.inner.lock().expect("state");
+            inner.sandboxes.insert(id.clone(), sandbox);
+            inner.vms.insert(id, vm);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": 500,
+                    "message": format!("sandbox teardown failed: {err}")
+                })),
+            ));
+        }
     }
-    if let Some(mut vm) = inner.vms.remove(&id) {
-        boot::teardown_vm(&mut vm);
-    }
+    let mut inner = state.inner.lock().expect("state");
     match inner.slots.release(&id) {
         Ok(_) | Err(SlotError::Unknown) => {}
         Err(SlotError::Exhausted) => {}
@@ -431,6 +595,47 @@ mod tests {
                 r#"{"sandboxID":"sbx_abc","templateID":"base","vcpu":2,"memMiB":2048,"envVars":{"FOO":"bar"},"allowInternet":true,"envdAccessToken":"token"}"#,
             ))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_and_admin_share_the_status_payload() {
+        let app = router();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["service"], "agent-sandbox-node");
+        assert!(json["status"] == "ok" || json["status"] == "degraded");
+        assert!(json["capacity"]["running"].is_number());
+        assert!(json["kvm"]["devicePresent"].is_boolean());
+        assert!(json["artifacts"]["configured"].is_boolean());
+        assert!(json["sandboxes"].is_array());
+        assert!(json["capacity"].get("committedMemMiB").is_some());
+
+        let app = router();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("/v1/status"));
+        assert!(html.contains("sandboxID"));
+        assert!(html.contains("guestIP"));
+        assert!(html.contains("memMiB"));
     }
 
     #[tokio::test]

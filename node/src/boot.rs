@@ -450,9 +450,81 @@ fn response_complete(buf: &[u8], hdr_end: usize) -> bool {
     true
 }
 
-pub fn teardown_vm(vm: &mut BootedVm) {
+pub fn teardown_vm(vm: &mut BootedVm) -> Result<(), String> {
+    kill_jail_tree(&vm.jail_id)?;
     let _ = vm.child.kill();
     let _ = vm.child.wait();
     destroy_tap_name(&vm.tap_name);
     cleanup_jail(&vm.chroot_base, &vm.jail_id);
+    if jail_process_alive(&vm.jail_id) {
+        return Err(format!("jail {} still running", vm.jail_id));
+    }
+    Ok(())
+}
+
+/// One argv, and it must not start with `-`. This procps treats a `--`
+/// separator as a pattern of its own, then rejects the real pattern.
+pub fn jail_process_pattern(jail_id: &str) -> String {
+    format!("[{}]id {jail_id}", "-")
+}
+
+pub fn cmdline_matches_jail(cmdline: &[u8], jail_id: &str) -> bool {
+    let text = String::from_utf8_lossy(cmdline).replace('\0', " ");
+    text.contains(&format!("--id {jail_id}")) || text.contains(&format!("/srv/jailer/{jail_id}"))
+}
+
+/// Jailer daemonizes Firecracker, so the direct child is not the VM.
+fn kill_jail_tree(jail_id: &str) -> Result<(), String> {
+    let pattern = jail_process_pattern(jail_id);
+    let _ = Command::new("pkill").args(["-KILL", "-f", &pattern]).status();
+    let _ = Command::new("pkill")
+        .args(["-KILL", "-f", &format!("/srv/jailer/{jail_id}")])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !jail_process_alive(jail_id) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("jail {jail_id} still running after pkill"))
+}
+
+fn jail_process_alive(jail_id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str() else { continue };
+        if !pid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmdline_matches_jail(&cmdline, jail_id) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod jail_pattern_tests {
+    use super::{cmdline_matches_jail, jail_process_pattern};
+
+    #[test]
+    fn jail_process_pattern_is_one_non_option_argv() {
+        let pattern = jail_process_pattern("sbxxprobe1");
+        assert_eq!(pattern, "[-]id sbxxprobe1");
+        assert!(!pattern.starts_with('-'));
+    }
+
+    #[test]
+    fn cmdline_matches_jail_sees_nul_separator() {
+        let cmdline = b"/firecracker\0--id\0sbxxprobe1\0--api-sock";
+        assert!(cmdline_matches_jail(cmdline, "sbxxprobe1"));
+        assert!(!cmdline_matches_jail(cmdline, "other"));
+    }
 }
